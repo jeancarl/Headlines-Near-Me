@@ -1,0 +1,106 @@
+// Filename: app.js
+
+var DATABASE = '';
+var USERNAME = '';
+var PASSWORD = '';
+var ACCOUNT_ID = '';
+var GOOGLE_GEOCODING_API_KEY = '';
+var PORT = 8080;
+
+var cps = require('cps-api');
+var xpath = require('xpath')
+var dom = require('xmldom').DOMParser;
+var request = require('request');
+var stories = [];
+
+var express = require('express');
+var app = express();
+
+var conn = new cps.Connection('tcp://cloud-us-0.clusterpoint.com:9007', 'DATABASE', 'USERNAME', 'PASSWORD', 'document', 'document/id', {account: ACCOUNT_ID});
+
+function getLocation(location, callback) {
+  request({
+      url: 'https://maps.googleapis.com/maps/api/geocode/json',
+      qs: {
+        address: location,
+        key: GOOGLE_GEOCODING_API_KEY
+      },
+      method: 'GET',
+    },
+    function(err, response, body) {
+      var result = JSON.parse(body);
+      console.log(location);
+      console.log(body);
+      callback(result.results[0].geometry.location);
+    }
+  );
+}
+
+function fetchStories() {
+  console.log('Fetching stories');
+  console.log(new Date());
+
+  request({
+    url: 'http://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml',
+    method: 'GET',
+  },
+  function(err, response, body) {
+    var doc = new dom().parseFromString(body);
+    var nodes = xpath.select("//rss/channel/item[category/@domain = 'http://www.nytimes.com/namespaces/keywords/nyt_geo']", doc);
+
+    for(var i in nodes) {
+      var title = nodes[i].getElementsByTagName('title')[0].firstChild.data;
+      var guid = nodes[i].getElementsByTagName('guid')[0].firstChild.data;
+      var pubDate = new Date(nodes[i].getElementsByTagName('pubDate')[0].firstChild.data);
+      var location = '';
+
+      var categories = nodes[i].getElementsByTagName('category');
+
+      for(var j in categories) {
+        for(var k in categories[j].attributes) {
+          if(categories[j].attributes[k].localName == 'domain' && categories[j].attributes[k].value == 'http://www.nytimes.com/namespaces/keywords/nyt_geo') {
+            location = categories[j].firstChild.data;
+            break;
+          }
+        }
+      }
+
+      if(location.length)
+        stories.push({title: title, location: location, url: guid, published: pubDate.getTime()});
+    }
+  });
+}
+
+function addStory(story) {
+  story.id = story.url;
+  // TODO: Check if a id key already exists in database. If so, don't try adding it.
+  // Currently, CP returns error code 2626 when id key is duplicated, and this is just ignored.
+
+  conn.sendRequest(new cps.InsertRequest([story]), function (err, resp) {
+     if(err && err[0].code != 2626) return console.error(err); 
+  });
+}
+
+// This fetches the stories on startup, and then at intervals.
+fetchStories();
+setInterval(fetchStories, 30*60*1000);
+
+// Process through stories in a controlled manner to prevent hitting rate limits on Google's Geocoding API.
+// Interval may be reduced to process more stories.
+setInterval(function() {
+  if(stories.length == 0)
+    return;
+
+  var story = stories.shift();
+  
+  getLocation(story.location, function(geo) {
+    story.lat = geo.lat;
+    story.lng = geo.lng;
+    addStory(story);
+  });
+}, 1000);
+
+app.use(express.static(__dirname + '/public'));
+app.listen(PORT);
+
+console.log('Application listening on port '+PORT);
